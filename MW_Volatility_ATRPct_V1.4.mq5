@@ -1,0 +1,866 @@
+//+------------------------------------------------------------------+
+//|                            MW_Volatility_ATRPct_V1.4.mq5         |
+//|                                  Copyright 2026 P. Paarsch       |
+//|                              https://t.me/Liquidity_Laboratory   |
+//|                                                                  |
+//| One volatility line per symbol of the Market Watch (max. 10),    |
+//| drawn in its own indicator window.                               |
+//|                                                                  |
+//| Symbol source: ONLY the symbols the user selected in the Market  |
+//| Watch - SymbolsTotal(true) / SymbolName(i, true). The indicator  |
+//| never calls SymbolSelect() and never reads the full broker list, |
+//| so the Market Watch stays exactly as the user left it.           |
+//|                                                                  |
+//| Two builds from one source, switched by one define:              |
+//|  VOL_PERCENTILE defined = ATR percentile rank 0..100             |
+//|  VOL_PERCENTILE absent  = ATR in percent of the close price       |
+//|                                                                  |
+//| V1.1: optional symbol labels at the end of every line.           |
+//| V1.2: end label size as a list (Tiny / Small / Medium / Normal). |
+//| V1.3: shared symbol thread protected - a symbol is recalculated  |
+//|       only after a new quote, compute time per call is capped    |
+//|       (rest continues next second), load stats every 5 minutes.  |
+//| V1.4: shows the TOP 10 of the whole Market Watch (highest ATR%), |
+//|       re-ranked every X minutes; staying symbols keep their slot.|
+//+------------------------------------------------------------------+
+//#define VOL_PERCENTILE                // ATR% build: percentile switched off
+
+#property copyright   "Copyright 2026 P. Paarsch"
+#property link        "https://t.me/Liquidity_Laboratory"
+#property version     "1.40"
+#property description "Volatility of every Market Watch symbol in one window (max. 10 lines)."
+#property description "Reads only the symbols you selected - the Market Watch is never changed."
+#property description "t.me/Liquidity_Laboratory"
+#property indicator_separate_window
+#property indicator_buffers 10
+#property indicator_plots   10
+
+#ifdef VOL_PERCENTILE
+#property indicator_minimum 0
+#property indicator_maximum 100
+#property indicator_level1  20
+#property indicator_level2  80
+#property indicator_levelcolor clrSilver
+#property indicator_levelstyle STYLE_DOT
+#endif
+
+//--- default palette, blue first; changeable per slot in the Colors tab
+#property indicator_type1   DRAW_LINE
+#property indicator_color1  clrDodgerBlue
+#property indicator_type2   DRAW_LINE
+#property indicator_color2  clrDarkOrange
+#property indicator_type3   DRAW_LINE
+#property indicator_color3  clrMagenta
+#property indicator_type4   DRAW_LINE
+#property indicator_color4  clrForestGreen
+#property indicator_type5   DRAW_LINE
+#property indicator_color5  clrRed
+#property indicator_type6   DRAW_LINE
+#property indicator_color6  clrGoldenrod
+#property indicator_type7   DRAW_LINE
+#property indicator_color7  clrDarkTurquoise
+#property indicator_type8   DRAW_LINE
+#property indicator_color8  clrBlueViolet
+#property indicator_type9   DRAW_LINE
+#property indicator_color9  clrSienna
+#property indicator_type10  DRAW_LINE
+#property indicator_color10 clrGray
+
+//+------------------------------------------------------------------+
+//| LICENSE - blank by default. 0 = unbound, far date = no expiry.   |
+//+------------------------------------------------------------------+
+#define LIC_ACCOUNT   0                 // 0 = unbound
+#define LIC_ACCOUNT2  0                 // 0 = unused
+#define LIC_EXPIRY    D'2099.12.31'     // last valid day
+
+#ifdef VOL_PERCENTILE
+#define IND_NAME   "MW Volatility Percentile"
+#define OBJ_FAMILY "MWVP_"
+#else
+#define IND_NAME   "MW Volatility ATR%"
+#define OBJ_FAMILY "MWVA_"
+#endif
+#define IND_VER    "1.4"
+#define MAX_SLOTS  10
+#define MW_SCAN_SEC 5                   // Market Watch re-scan interval
+#define RANK_BUDGET_US 5000            // max. ranking time per timer call
+#define BUDGET_US  15000                // max. compute time per call (all indicators
+                                        // of the chart symbol share one thread)
+#define STATS_SEC  300                  // load statistics interval in the Experts log
+#define CLEAN      INT_MAX              // g_dirty value: nothing to recompute
+#define MAX_SRC_BARS 50000              // cap of source bars per symbol (low TF on high chart TF)
+
+//==================================================================
+//  INPUTS
+//==================================================================
+//--- size of the line end labels; the value is the font size in points
+enum ENUM_LABEL_SIZE
+  {
+   LBL_TINY   = 6,   // Tiny
+   LBL_SMALL  = 7,   // Small
+   LBL_MEDIUM = 8,   // Medium
+   LBL_NORMAL = 10   // Normal
+  };
+
+input group "Calculation"
+input ENUM_TIMEFRAMES InpTF       = PERIOD_CURRENT; // Timeframe (Current = chart)
+input int             InpATRPeriod = 14;            // ATR period
+#ifdef VOL_PERCENTILE
+input int             InpLookback  = 100;           // Percentile lookback (bars)
+input double          InpLevelLow  = 20;            // Lower level
+input double          InpLevelHigh = 80;            // Upper level
+#endif
+input int             InpMaxBars   = 1000;          // Max bars to calculate (0 = all)
+input int             InpRerankMin = 5;             // Re-rank top 10 every X minutes
+
+input group "Display"
+input bool             InpHighlightChart = true;              // Highlight chart symbol (thick line)
+input int              InpLineWidth      = 1;                 // Line width
+input int              InpHighlightWidth = 3;                 // Line width of chart symbol
+input ENUM_BASE_CORNER InpLegendCorner   = CORNER_LEFT_UPPER; // Legend corner
+input int              InpLegendFont     = 9;                 // Legend font size
+input bool             InpShowEndLabels  = true;              // Show symbol labels at line ends
+input ENUM_LABEL_SIZE  InpEndLabelSize   = LBL_MEDIUM;        // Line end label size
+input bool             InpShowBranding   = true;              // Show branding
+
+//==================================================================
+//  GLOBALS
+//==================================================================
+double B0[], B1[], B2[], B3[], B4[], B5[], B6[], B7[], B8[], B9[];
+
+string          g_pfx;                  // object prefix of this instance
+ENUM_TIMEFRAMES g_tf;                   // calculation timeframe
+int             g_warm;                 // source bars needed before the first value
+string          g_sym[MAX_SLOTS];       // symbol per slot ("" = unused)
+bool            g_ready[MAX_SLOTS];     // slot fully calculated
+double          g_cur[MAX_SLOTS];       // value at the last chart bar
+int             g_used    = 0;          // highest occupied slot + 1
+int             g_mwTotal = 0;          // Market Watch symbols in the last ranking
+string          g_all[];                // all Market Watch symbols
+double          g_allVal[];             // their current volatility (-1 = no data)
+int             g_rankPos = -1;         // ranking cursor (-1 = no ranking running)
+ulong           g_lastRank = 0;         // GetTickCount64 of the last finished ranking
+string          g_status  = "";         // status line currently shown
+string          g_mwKey   = "";         // joined symbol list of the last scan
+datetime        g_t[];                  // chart bar times (non-series)
+int             g_rates   = 0;          // rates_total of the last OnCalculate
+int             g_drawFrom = 0;         // first chart bar that gets values
+ulong           g_lastScan = 0;         // GetTickCount64 of the last scan
+int             g_dirty[MAX_SLOTS];     // first chart bar to recompute (CLEAN = none)
+long            g_lastQuote[MAX_SLOTS]; // SYMBOL_TIME_MSC of the last calculation
+int             g_rr = 0;               // round-robin start slot after a budget stop
+bool            g_redraw = true;        // legend/labels need an update
+//--- load statistics
+ulong           g_stLast = 0;
+long            g_stCalls = 0, g_stSlots = 0, g_stStops = 0;
+ulong           g_stSumUs = 0, g_stMaxUs = 0;
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   //--- license
+   long acc = AccountInfoInteger(ACCOUNT_LOGIN);
+   if((LIC_ACCOUNT != 0 || LIC_ACCOUNT2 != 0) &&
+      acc != (long)LIC_ACCOUNT && acc != (long)LIC_ACCOUNT2)
+     {
+      string m = StringFormat("%s: this build is not licensed for account %I64d.", IND_NAME, acc);
+      Print(m); Alert(m);
+      return(INIT_FAILED);
+     }
+   datetime now = (TimeCurrent() > TimeGMT()) ? TimeCurrent() : TimeGMT();
+   if(now > LIC_EXPIRY + 86399)
+     {
+      string m = StringFormat("%s: this version expired on %s.", IND_NAME,
+                              TimeToString(LIC_EXPIRY, TIME_DATE));
+      Print(m); Alert(m);
+      return(INIT_FAILED);
+     }
+
+   if(InpRerankMin < 1)
+     {
+      Print(IND_NAME, ": re-rank interval must be >= 1 minute.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(InpATRPeriod < 1)
+     {
+      Print(IND_NAME, ": ATR period must be >= 1.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+#ifdef VOL_PERCENTILE
+   if(InpLookback < 2)
+     {
+      Print(IND_NAME, ": percentile lookback must be >= 2.");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   g_warm = InpATRPeriod + InpLookback + 1;
+#else
+   g_warm = InpATRPeriod + 1;
+#endif
+
+   //--- unique prefix per instance: MT5 loads the new instance BEFORE it
+   //--- removes the old one on a timeframe change
+   g_pfx = OBJ_FAMILY + IntegerToString((long)(GetTickCount64() % 100000000)) + "_" +
+           IntegerToString((long)(GetMicrosecondCount() % 1000000)) + "_";
+   //--- remove leftovers of other instances (templates, crashes)
+   for(int n = ObjectsTotal(0, -1, -1) - 1; n >= 0; n--)
+     {
+      string on = ObjectName(0, n, -1, -1);
+      if(StringFind(on, OBJ_FAMILY) == 0 && StringFind(on, g_pfx) != 0)
+         ObjectDelete(0, on);
+     }
+
+   g_tf = (InpTF == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTF;
+
+   SetIndexBuffer(0, B0, INDICATOR_DATA);
+   SetIndexBuffer(1, B1, INDICATOR_DATA);
+   SetIndexBuffer(2, B2, INDICATOR_DATA);
+   SetIndexBuffer(3, B3, INDICATOR_DATA);
+   SetIndexBuffer(4, B4, INDICATOR_DATA);
+   SetIndexBuffer(5, B5, INDICATOR_DATA);
+   SetIndexBuffer(6, B6, INDICATOR_DATA);
+   SetIndexBuffer(7, B7, INDICATOR_DATA);
+   SetIndexBuffer(8, B8, INDICATOR_DATA);
+   SetIndexBuffer(9, B9, INDICATOR_DATA);
+   for(int k = 0; k < MAX_SLOTS; k++)
+     {
+      PlotIndexSetDouble(k, PLOT_EMPTY_VALUE, EMPTY_VALUE);
+      g_sym[k]   = "";
+      g_ready[k] = false;
+      g_cur[k]   = EMPTY_VALUE;
+      g_dirty[k] = CLEAN;
+      g_lastQuote[k] = 0;
+     }
+   for(int k = 0; k < MAX_SLOTS; k++) AssignSlot(k, "");   // hidden until ranked
+   g_stLast = GetTickCount64();
+
+#ifdef VOL_PERCENTILE
+   IndicatorSetString(INDICATOR_SHORTNAME, StringFormat("%s V%s (%s, ATR %d, LB %d)",
+                      IND_NAME, IND_VER, TfName(g_tf), InpATRPeriod, InpLookback));
+   IndicatorSetInteger(INDICATOR_DIGITS, 1);
+   IndicatorSetInteger(INDICATOR_LEVELS, 2);
+   IndicatorSetDouble(INDICATOR_LEVELVALUE, 0, InpLevelLow);
+   IndicatorSetDouble(INDICATOR_LEVELVALUE, 1, InpLevelHigh);
+#else
+   IndicatorSetString(INDICATOR_SHORTNAME, StringFormat("%s V%s (%s, ATR %d)",
+                      IND_NAME, IND_VER, TfName(g_tf), InpATRPeriod));
+   IndicatorSetInteger(INDICATOR_DIGITS, 3);
+#endif
+
+   ScanMarketWatch();
+   EventSetTimer(1);
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   ObjectsDeleteAll(0, g_pfx);          // own instance only
+  }
+
+//+------------------------------------------------------------------+
+int OnCalculate(const int rates_total,
+                const int prev_calculated,
+                const datetime &time[],
+                const double &open[],
+                const double &high[],
+                const double &low[],
+                const double &close[],
+                const long &tick_volume[],
+                const long &volume[],
+                const int &spread[])
+  {
+   if(rates_total < 2) return(0);
+
+   bool full = (prev_calculated == 0 || rates_total - prev_calculated > 1 ||
+                rates_total < g_rates);
+   if(full)
+     {
+      ArrayResize(g_t, rates_total);
+      ArrayCopy(g_t, time, 0, 0, rates_total);
+      g_rates    = rates_total;
+      g_drawFrom = (InpMaxBars > 0 && rates_total > InpMaxBars) ? rates_total - InpMaxBars : 0;
+      for(int k = 0; k < MAX_SLOTS; k++)
+        {
+         ClearSlot(k);
+         g_ready[k] = false;
+         PlotIndexSetInteger(k, PLOT_DRAW_BEGIN, g_drawFrom);
+        }
+     }
+   else if(rates_total != g_rates)
+     {
+      //--- one new chart bar
+      ArrayResize(g_t, rates_total);
+      g_t[rates_total - 2] = time[rates_total - 2];
+      g_t[rates_total - 1] = time[rates_total - 1];
+      g_rates = rates_total;
+      for(int k = 0; k < g_used; k++)
+        {
+         SetVal(k, rates_total - 1, EMPTY_VALUE);
+         g_dirty[k] = MathMin(g_dirty[k], rates_total - 2);   // close the old bar
+        }
+     }
+   else
+      return(rates_total);              // plain tick: the timer does the work
+
+   UpdateAll();
+   return(rates_total);
+  }
+
+//+------------------------------------------------------------------+
+//| Timer: live update of all slots, Market Watch re-scan, legend.   |
+//| Ticks of foreign symbols never reach OnCalculate, so the live    |
+//| values come from here (once per second).                         |
+//+------------------------------------------------------------------+
+void OnTimer()
+  {
+   if(GetTickCount64() - g_lastScan >= MW_SCAN_SEC * 1000)
+     {
+      ScanMarketWatch();
+      g_redraw = true;                  // restores labels removed by others
+     }
+   CheckRerank();
+   RankStep();
+   if(StatusText() != g_status) g_redraw = true;
+   if(g_rates > 0)
+      UpdateAll();
+   if(GetTickCount64() - g_stLast >= STATS_SEC * 1000)
+      PrintStats();
+  }
+
+//--- load report, so a busy symbol thread can be traced to its cause
+void PrintStats()
+  {
+   int pending = 0;
+   for(int k = 0; k < g_used; k++) if(g_sym[k] != "" && !g_ready[k]) pending++;
+   PrintFormat("%s: last %d min: %I64d calls, %I64d symbol calcs, avg %I64u us, max %I64u us per call, %I64d budget stops, %d symbol(s) loading",
+               IND_NAME, STATS_SEC / 60, g_stCalls, g_stSlots,
+               g_stCalls > 0 ? g_stSumUs / (ulong)g_stCalls : 0, g_stMaxUs, g_stStops, pending);
+   g_stLast  = GetTickCount64();
+   g_stCalls = 0; g_stSlots = 0; g_stStops = 0; g_stSumUs = 0; g_stMaxUs = 0;
+  }
+
+//==================================================================
+//  MARKET WATCH
+//==================================================================
+//--- reads the Market Watch selection; changes nothing in it.
+//--- A changed list starts a new ranking at once.
+void ScanMarketWatch()
+  {
+   g_lastScan = GetTickCount64();
+   int total = SymbolsTotal(true);      // true = Market Watch only
+   string list[];
+   ArrayResize(list, 0);
+   string key = "";
+   for(int i = 0; i < total; i++)
+     {
+      string s = SymbolName(i, true);   // true = Market Watch only
+      if(s == "") continue;
+      int n = ArraySize(list);
+      ArrayResize(list, n + 1);
+      list[n] = s;
+      key += s + ";";
+     }
+   if(key == g_mwKey) return;
+   g_mwKey = key;
+
+   int cnt = ArraySize(list);
+   ArrayResize(g_all, cnt);
+   ArrayResize(g_allVal, cnt);
+   for(int i = 0; i < cnt; i++) { g_all[i] = list[i]; g_allVal[i] = -1.0; }
+   g_rankPos = 0;                       // (re)start ranking
+   PrintFormat("%s: %d Market Watch symbol(s), ranking for the top %d", IND_NAME, cnt, MAX_SLOTS);
+  }
+
+//==================================================================
+//  RANKING (top MAX_SLOTS of the whole Market Watch)
+//==================================================================
+//--- starts a ranking every InpRerankMin minutes
+void CheckRerank()
+  {
+   if(g_rankPos >= 0) return;
+   if(GetTickCount64() - g_lastRank >= (ulong)InpRerankMin * 60000)
+     {
+      for(int i = 0; i < ArraySize(g_allVal); i++) g_allVal[i] = -1.0;
+      g_rankPos = 0;
+     }
+  }
+
+//--- measures the next symbols within the time budget; applies the
+//--- result once every symbol of the list has been measured
+void RankStep()
+  {
+   if(g_rankPos < 0) return;
+   int n = ArraySize(g_all);
+   ulong t0 = GetMicrosecondCount();
+   while(g_rankPos < n)
+     {
+      if(GetMicrosecondCount() - t0 > RANK_BUDGET_US) return;   // continue next second
+      g_allVal[g_rankPos] = QuickVolatility(g_all[g_rankPos]);
+      g_rankPos++;
+     }
+   ApplyRanking();
+   g_rankPos  = -1;
+   g_lastRank = GetTickCount64();
+   //--- symbols still loading history could belong to the top:
+   //--- then rank again after 30 s instead of the full interval
+   int missing = 0;
+   for(int i = 0; i < n; i++) if(g_allVal[i] < 0.0) missing++;
+   ulong full = (ulong)InpRerankMin * 60000;
+   if(missing > 0 && full > 30000) g_lastRank -= (full - 30000);
+  }
+
+//--- current value of one symbol (same measure as the lines);
+//--- -1 while its history is not available
+double QuickVolatility(const string s)
+  {
+   MqlRates r[];
+   int need = InpATRPeriod + 1;
+   if(CopyRates(s, g_tf, 0, need, r) != need) return(-1.0);
+   double sum = 0.0;
+   for(int i = 1; i < need; i++)
+      sum += MathMax(r[i].high, r[i-1].close) - MathMin(r[i].low, r[i-1].close);
+   double c = r[need-1].close;
+   return(c > 0.0 ? sum / InpATRPeriod / c * 100.0 : -1.0);
+  }
+
+//--- picks the top MAX_SLOTS; symbols that stay keep their slot (and colour)
+void ApplyRanking()
+  {
+   int n = ArraySize(g_all);
+   int idx[];
+   ArrayResize(idx, n);
+   for(int i = 0; i < n; i++) idx[i] = i;
+   for(int a = 1; a < n; a++)           // insertion sort, highest first
+     {
+      int key = idx[a];
+      int b = a - 1;
+      while(b >= 0 && g_allVal[idx[b]] < g_allVal[key]) { idx[b+1] = idx[b]; b--; }
+      idx[b+1] = key;
+     }
+   int take = MathMin(n, MAX_SLOTS);
+   string top[];
+   ArrayResize(top, take);
+   for(int i = 0; i < take; i++) top[i] = g_all[idx[i]];
+   g_mwTotal = n;
+
+   //--- 1. keep symbols that are still in the top list
+   bool placed[];
+   ArrayResize(placed, take);
+   ArrayInitialize(placed, false);
+   bool keep[MAX_SLOTS];
+   for(int k = 0; k < MAX_SLOTS; k++)
+     {
+      keep[k] = false;
+      if(g_sym[k] == "") continue;
+      for(int i = 0; i < take; i++)
+         if(!placed[i] && top[i] == g_sym[k]) { keep[k] = true; placed[i] = true; break; }
+     }
+   //--- 2. free the other slots, 3. fill them with the newcomers
+   int changes = 0;
+   for(int k = 0; k < MAX_SLOTS; k++)
+     {
+      if(keep[k]) continue;
+      string s = "";
+      for(int i = 0; i < take; i++)
+         if(!placed[i]) { s = top[i]; placed[i] = true; break; }
+      if(s != g_sym[k]) { AssignSlot(k, s); changes++; }
+     }
+   g_used = 0;
+   for(int k = 0; k < MAX_SLOTS; k++) if(g_sym[k] != "") g_used = k + 1;
+   g_redraw = true;
+   if(changes > 0)
+      PrintFormat("%s: ranking done, %d of %d symbols shown, %d slot(s) changed",
+                  IND_NAME, take, n, changes);
+  }
+
+void AssignSlot(const int k, const string s)
+  {
+   g_sym[k]       = s;
+   g_ready[k]     = false;
+   g_cur[k]       = EMPTY_VALUE;
+   g_dirty[k]     = CLEAN;
+   g_lastQuote[k] = 0;
+   ClearSlot(k);
+   if(s == "")
+     {
+      PlotIndexSetInteger(k, PLOT_DRAW_TYPE, DRAW_NONE);
+      PlotIndexSetInteger(k, PLOT_SHOW_DATA, false);
+      PlotIndexSetString(k, PLOT_LABEL, "unused");
+     }
+   else
+     {
+      bool hl = InpHighlightChart && s == _Symbol;
+      PlotIndexSetInteger(k, PLOT_DRAW_TYPE, DRAW_LINE);
+      PlotIndexSetInteger(k, PLOT_SHOW_DATA, true);
+      PlotIndexSetInteger(k, PLOT_LINE_WIDTH, hl ? InpHighlightWidth : InpLineWidth);
+      PlotIndexSetString(k, PLOT_LABEL, s);
+     }
+  }
+
+//==================================================================
+//  CALCULATION
+//==================================================================
+//+------------------------------------------------------------------+
+//| All indicators of the chart symbol run in ONE thread, together   |
+//| with its tick processing. Therefore:                             |
+//|  - a symbol is only recalculated when it has a new quote, a new  |
+//|    chart bar has to be closed, or it is not calculated yet       |
+//|  - the call stops after BUDGET_US; the next call (timer, 1 s)    |
+//|    continues with the next slot (round robin)                    |
+//+------------------------------------------------------------------+
+void UpdateAll()
+  {
+   if(g_rates < 2 || g_used < 1) { if(g_redraw) RedrawObjects(); return; }
+   ulong t0 = GetMicrosecondCount();
+   int start = (g_rr < g_used) ? g_rr : 0;
+   bool stopped = false;
+   for(int c = 0; c < g_used; c++)
+     {
+      int k = (start + c) % g_used;
+      if(c > 0 && GetMicrosecondCount() - t0 > BUDGET_US)
+        {
+         g_rr = k;
+         stopped = true;
+         g_stStops++;
+         break;
+        }
+      if(g_sym[k] == "") continue;
+
+      long quote = SymbolInfoInteger(g_sym[k], SYMBOL_TIME_MSC);
+      int from;
+      if(!g_ready[k])               from = g_drawFrom;
+      else if(g_dirty[k] != CLEAN)  from = MathMax(g_drawFrom, g_dirty[k]);
+      else if(quote != g_lastQuote[k]) from = MathMax(g_drawFrom, g_rates - 1);
+      else continue;                    // nothing new for this symbol
+
+      g_stSlots++;
+      if(ComputeSlot(k, from))
+        {
+         g_ready[k]     = true;
+         g_dirty[k]     = CLEAN;
+         g_lastQuote[k] = quote;
+         g_redraw       = true;
+        }
+      else if(g_ready[k])
+         g_dirty[k] = MathMin(g_dirty[k], from);   // retry this range next call
+     }
+   if(!stopped) g_rr = 0;
+
+   ulong us = GetMicrosecondCount() - t0;
+   g_stCalls++;
+   g_stSumUs += us;
+   if(us > g_stMaxUs) g_stMaxUs = us;
+
+   if(g_redraw) RedrawObjects();
+  }
+
+void RedrawObjects()
+  {
+   DrawLegend();
+   DrawEndLabels();
+   DrawBranding();
+   ChartRedraw();
+   g_redraw = false;
+  }
+
+//+------------------------------------------------------------------+
+//| Fills chart bars [fromBar .. g_rates-1] of one slot.             |
+//| Returns false while the symbol history is not available yet -    |
+//| the timer simply tries again, no error is raised.                |
+//+------------------------------------------------------------------+
+bool ComputeSlot(const int k, const int fromBar)
+  {
+   string s = g_sym[k];
+   int avail = Bars(s, g_tf);           // also starts the history download
+   if(avail <= g_warm) return(false);
+
+   //--- source bars from the first chart bar to be filled up to now
+   int shift = iBarShift(s, g_tf, g_t[fromBar], false);
+   if(shift < 0) shift = avail - 1;
+   int need = MathMin(MathMin(shift + 1 + g_warm, avail), MAX_SRC_BARS);
+
+   MqlRates r[];
+   int n = CopyRates(s, g_tf, 0, need, r);   // r[0] = oldest
+   if(n <= g_warm) return(false);
+
+   //--- ATR as SMA of the true range (same definition as MT5's iATR)
+   double atr[];
+   ArrayResize(atr, n);
+   double sum = 0.0;
+   for(int i = 0; i < n; i++)
+     {
+      double tr = (i == 0) ? r[i].high - r[i].low
+                  : MathMax(r[i].high, r[i-1].close) - MathMin(r[i].low, r[i-1].close);
+      atr[i] = EMPTY_VALUE;
+      if(i == 0) continue;              // first TR has no previous close
+      sum += tr;
+      if(i > InpATRPeriod)
+        {
+         double old = MathMax(r[i-InpATRPeriod].high, r[i-InpATRPeriod-1].close) -
+                      MathMin(r[i-InpATRPeriod].low,  r[i-InpATRPeriod-1].close);
+         sum -= old;
+        }
+      if(i >= InpATRPeriod) atr[i] = sum / InpATRPeriod;
+     }
+
+   //--- volatility value per source bar
+   double val[];
+   ArrayResize(val, n);
+   for(int i = 0; i < n; i++) val[i] = EMPTY_VALUE;
+#ifdef VOL_PERCENTILE
+   for(int i = InpATRPeriod + InpLookback; i < n; i++)
+     {
+      //--- percentile rank of the current ATR against the previous N values;
+      //--- ties count half, so a completely flat ATR reads 50
+      double less = 0.0, eq = 0.0;
+      for(int j = i - InpLookback; j < i; j++)
+        {
+         if(atr[j] < atr[i])       less += 1.0;
+         else if(atr[j] == atr[i]) eq   += 1.0;
+        }
+      val[i] = (less + 0.5 * eq) / InpLookback * 100.0;
+     }
+#else
+   for(int i = InpATRPeriod; i < n; i++)
+      if(r[i].close > 0.0) val[i] = atr[i] / r[i].close * 100.0;
+#endif
+
+   //--- map onto chart bars by time: a chart bar takes the last source bar
+   //--- that opened before the chart bar closed (works for any TF ratio)
+   int chartSec = PeriodSeconds(_Period);
+   int p = 0;
+   for(int b = fromBar; b < g_rates; b++)
+     {
+      datetime tEnd = g_t[b] + chartSec;
+      while(p + 1 < n && r[p+1].time < tEnd) p++;
+      double v = (r[p].time < tEnd) ? val[p] : EMPTY_VALUE;
+      SetVal(k, b, v);
+     }
+   g_cur[k] = GetVal(k, g_rates - 1);
+   return(true);
+  }
+
+//==================================================================
+//  BUFFER ACCESS (indicator buffers cannot live in an array)
+//==================================================================
+void SetVal(const int k, const int i, const double v)
+  {
+   switch(k)
+     {
+      case 0: B0[i] = v; break;
+      case 1: B1[i] = v; break;
+      case 2: B2[i] = v; break;
+      case 3: B3[i] = v; break;
+      case 4: B4[i] = v; break;
+      case 5: B5[i] = v; break;
+      case 6: B6[i] = v; break;
+      case 7: B7[i] = v; break;
+      case 8: B8[i] = v; break;
+      case 9: B9[i] = v; break;
+     }
+  }
+
+double GetVal(const int k, const int i)
+  {
+   switch(k)
+     {
+      case 0: return(B0[i]);
+      case 1: return(B1[i]);
+      case 2: return(B2[i]);
+      case 3: return(B3[i]);
+      case 4: return(B4[i]);
+      case 5: return(B5[i]);
+      case 6: return(B6[i]);
+      case 7: return(B7[i]);
+      case 8: return(B8[i]);
+      case 9: return(B9[i]);
+     }
+   return(EMPTY_VALUE);
+  }
+
+void ClearSlot(const int k)
+  {
+   switch(k)
+     {
+      case 0: ArrayInitialize(B0, EMPTY_VALUE); break;
+      case 1: ArrayInitialize(B1, EMPTY_VALUE); break;
+      case 2: ArrayInitialize(B2, EMPTY_VALUE); break;
+      case 3: ArrayInitialize(B3, EMPTY_VALUE); break;
+      case 4: ArrayInitialize(B4, EMPTY_VALUE); break;
+      case 5: ArrayInitialize(B5, EMPTY_VALUE); break;
+      case 6: ArrayInitialize(B6, EMPTY_VALUE); break;
+      case 7: ArrayInitialize(B7, EMPTY_VALUE); break;
+      case 8: ArrayInitialize(B8, EMPTY_VALUE); break;
+      case 9: ArrayInitialize(B9, EMPTY_VALUE); break;
+     }
+  }
+
+//==================================================================
+//  LEGEND (sorted: highest volatility on top)
+//==================================================================
+void DrawLegend()
+  {
+   int win = ChartWindowFind();
+   if(win < 0) return;
+
+   //--- order of slots by current value, descending; loading ones last
+   int ord[MAX_SLOTS];
+   int cnt = 0;
+   for(int k = 0; k < g_used; k++) if(g_sym[k] != "") ord[cnt++] = k;
+   for(int a = 1; a < cnt; a++)
+     {
+      int key = ord[a];
+      double kv = SortKey(key);
+      int b = a - 1;
+      while(b >= 0 && SortKey(ord[b]) < kv) { ord[b+1] = ord[b]; b--; }
+      ord[b+1] = key;
+     }
+
+   string txt[MAX_SLOTS + 2];
+   color  col[MAX_SLOTS + 2];
+   int lines = 0;
+   for(int n = 0; n < cnt; n++)
+     {
+      int k = ord[n];
+      string v;
+      if(!g_ready[k] || g_cur[k] == EMPTY_VALUE) v = "loading...";
+#ifdef VOL_PERCENTILE
+      else v = StringFormat("%5.1f", g_cur[k]);
+#else
+      else v = StringFormat("%.3f %%", g_cur[k]);
+#endif
+      txt[lines] = StringFormat("%s %-12s %s", (g_sym[k] == _Symbol ? "\x25BA" : "\x25A0"),
+                                g_sym[k], v);
+      col[lines] = (color)PlotIndexGetInteger(k, PLOT_LINE_COLOR);
+      lines++;
+     }
+   if(cnt == 0)
+     {
+      txt[lines] = (ArraySize(g_all) == 0) ? "Market Watch is empty" : "Ranking...";
+      col[lines] = (ArraySize(g_all) == 0) ? clrOrangeRed : clrGray;
+      lines++;
+     }
+   //--- status line: top N of M, time to the next ranking
+   g_status   = StatusText();
+   txt[lines] = g_status;
+   col[lines] = clrGray;
+   lines++;
+
+   int corner = (int)InpLegendCorner;
+   bool lower = (corner == CORNER_LEFT_LOWER || corner == CORNER_RIGHT_LOWER);
+   int step   = InpLegendFont + 7;
+   int baseY  = lower ? ((corner == CORNER_RIGHT_LOWER && InpShowBranding) ? 40 : 6) : 6;
+   for(int n = 0; n < MAX_SLOTS + 2; n++)
+     {
+      string name = g_pfx + "leg" + IntegerToString(n);
+      if(n >= lines) { ObjectDelete(0, name); continue; }
+      int y = lower ? baseY + (lines - 1 - n) * step : baseY + n * step;
+      SetLabel(name, win, txt[n], corner, 8, y, col[n], InpLegendFont);
+     }
+  }
+
+//--- minute resolution, so the legend is redrawn at most once a minute
+string StatusText()
+  {
+   if(g_rankPos >= 0)
+      return(StringFormat("Ranking %d/%d ...", g_rankPos, ArraySize(g_all)));
+   int shown = 0;
+   for(int k = 0; k < MAX_SLOTS; k++) if(g_sym[k] != "") shown++;
+   long left = (long)InpRerankMin * 60 - (long)((GetTickCount64() - g_lastRank) / 1000);
+   long mins = (left + 59) / 60;
+   if(mins < 1) mins = 1;
+   return(StringFormat("Top %d of %d | next ranking in %d min", shown, g_mwTotal, (int)mins));
+  }
+
+double SortKey(const int k)
+  {
+   return((!g_ready[k] || g_cur[k] == EMPTY_VALUE) ? -DBL_MAX : g_cur[k]);
+  }
+
+//==================================================================
+//  BRANDING
+//==================================================================
+void DrawBranding()
+  {
+   string au = g_pfx + "Author";
+   string ch = g_pfx + "Channel";
+   int win = ChartWindowFind();
+   if(!InpShowBranding || win < 0)
+     {
+      ObjectDelete(0, au);
+      ObjectDelete(0, ch);
+      return;
+     }
+   SetLabel(au, win, "P. Paarsch 2026",           CORNER_RIGHT_LOWER, 8, 21, clrGray, 7);
+   SetLabel(ch, win, "t.me/Liquidity_Laboratory", CORNER_RIGHT_LOWER, 8, 8,  clrGray, 7);
+   ObjectSetString(0, au, OBJPROP_TOOLTIP, "https://t.me/Liquidity_Laboratory");
+   ObjectSetString(0, ch, OBJPROP_TOOLTIP, "https://t.me/Liquidity_Laboratory");
+  }
+
+//==================================================================
+//  HELPERS
+//==================================================================
+void SetLabel(const string name, const int win, const string text, const int corner,
+              const int x, const int y, const color c, const int size)
+  {
+   if(ObjectFind(0, name) < 0)
+     {
+      ObjectCreate(0, name, OBJ_LABEL, win, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetInteger(0, name, OBJPROP_BACK, false);
+      ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+     }
+   ENUM_ANCHOR_POINT anc = ANCHOR_LEFT_UPPER;
+   if(corner == CORNER_RIGHT_UPPER) anc = ANCHOR_RIGHT_UPPER;
+   if(corner == CORNER_LEFT_LOWER)  anc = ANCHOR_LEFT_LOWER;
+   if(corner == CORNER_RIGHT_LOWER) anc = ANCHOR_RIGHT_LOWER;
+   ObjectSetInteger(0, name, OBJPROP_CORNER, corner);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, anc);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, c);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+  }
+
+//+------------------------------------------------------------------+
+//| Symbol name at the end of every line (optional). Anchored left   |
+//| of the last bar, so the text runs into the chart shift area.     |
+//+------------------------------------------------------------------+
+void DrawEndLabels()
+  {
+   int win = ChartWindowFind();
+   for(int k = 0; k < MAX_SLOTS; k++)
+     {
+      string name = g_pfx + "end" + IntegerToString(k);
+      if(!InpShowEndLabels || win < 0 || g_rates < 1 || k >= g_used ||
+         g_sym[k] == "" || !g_ready[k] || g_cur[k] == EMPTY_VALUE)
+        {
+         ObjectDelete(0, name);
+         continue;
+        }
+      datetime t = g_t[g_rates - 1];
+      if(ObjectFind(0, name) < 0)
+        {
+         ObjectCreate(0, name, OBJ_TEXT, win, t, g_cur[k]);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+         ObjectSetInteger(0, name, OBJPROP_BACK, false);
+         ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT);
+         ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+        }
+      else
+         ObjectMove(0, name, 0, t, g_cur[k]);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, (color)PlotIndexGetInteger(k, PLOT_LINE_COLOR));
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, (int)InpEndLabelSize);
+      ObjectSetString(0, name, OBJPROP_TEXT, "  " + g_sym[k]);
+     }
+  }
+
+string TfName(const ENUM_TIMEFRAMES tf)
+  {
+   return(StringSubstr(EnumToString(tf), 7));   // "PERIOD_M10" -> "M10"
+  }
+//+------------------------------------------------------------------+
